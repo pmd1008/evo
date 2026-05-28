@@ -4,6 +4,7 @@
 static const int W = 600;
 static const int H = 600;
 static const int GENOME_MAX = 128;
+static const int GPOOL_MAX = 1 << 19;
 static const int NUM_CLANS  = 4;
 
 enum Action : uint8_t {
@@ -40,7 +41,7 @@ struct Cell {
     uint8_t  signal;
     uint8_t  skip_next;
     uint8_t  sleeping;
-    int16_t  genome_idx;  // -1 = нет генома, иначе индекс в пуле
+    int32_t  genome_idx;  // -1 = нет генома, иначе индекс в пуле
     uint8_t  ip;          // instruction pointer (0..127)
     uint8_t  age_steps;   // счётчик старости (0..127)
     int16_t  sleep_ticks;
@@ -55,6 +56,21 @@ struct Soil {
     float charge;
     float toxin;
     float light;
+};
+
+struct SimParams {
+    float crowd_penalty;
+    float light_scale;
+    float leaf_gain;
+    float root_gain;
+    float antenna_gain;
+    float sprout_metabolism;
+    float passive_metabolism;
+    float growth_cost;
+    float sprout_cost;
+    float seed_cost;
+    float mutation_scale;
+    float toxin_scale;
 };
 
 // Статистика (атомарная, заполняется GPU)

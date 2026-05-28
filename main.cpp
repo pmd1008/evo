@@ -18,6 +18,7 @@ extern "C" {
                         float cam_x, float cam_y, float zoom, int rmode);
     void     sim_get_stats(Stats* out);
     uint64_t sim_get_tick();
+    void     sim_set_params(const SimParams* params);
 }
 
 // ─── константы окна ────────────────────────────────────────────
@@ -39,6 +40,21 @@ static int   rmode=0;
 static bool  paused=false;
 static int   tick_delay=0;
 static int   ticks_per_frame=5;
+static bool  show_settings=false;
+static SimParams sim_params{
+    0.18f, // crowd_penalty
+    1.00f, // light_scale
+    1.00f, // leaf_gain
+    1.00f, // root_gain
+    1.00f, // antenna_gain
+    1.00f, // sprout_metabolism
+    1.00f, // passive_metabolism
+    6.00f, // growth_cost
+    48.0f, // sprout_cost
+    20.0f, // seed_cost
+    1.00f, // mutation_scale
+    1.00f  // toxin_scale
+};
 
 static Stats  cur_stats{};
 static Stats  max_stats{};
@@ -58,6 +74,10 @@ static void reset_camera(){
     cam_x = 0;
     cam_y = 0;
     zoom  = 1.0f;
+}
+
+static void apply_sim_settings(){
+    sim_set_params(&sim_params);
 }
 
 // ─── шрифт ─────────────────────────────────────────────────────
@@ -113,6 +133,36 @@ static void draw_btn(const Btn& b, bool active, bool hover){
 // ─── рендер UI панели ──────────────────────────────────────────
 static const char* RM_NAME[]={"[1] Клетки","[2] Органика","[3] Заряд","[4] Токсин","[5] Свет","[6] Кланы"};
 
+struct SettingDef {
+    const char* label;
+    float* value;
+    float step;
+    float minv;
+    float maxv;
+};
+
+static SettingDef SETTINGS[] = {
+    {"Солнце",    &sim_params.light_scale,        0.25f, 0.00f, 10.0f},
+    {"Листья",    &sim_params.leaf_gain,          0.25f, 0.00f, 8.00f},
+    {"Корни",     &sim_params.root_gain,          0.25f, 0.00f, 8.00f},
+    {"Антенны",   &sim_params.antenna_gain,       0.25f, 0.00f, 8.00f},
+    {"Скуч.",     &sim_params.crowd_penalty,      0.10f, 0.00f, 3.00f},
+    {"Отростки",  &sim_params.sprout_metabolism,  0.25f, 0.05f, 10.0f},
+    {"Органы",    &sim_params.passive_metabolism, 0.25f, 0.05f, 10.0f},
+    {"Рост",      &sim_params.growth_cost,        1.00f, 0.50f, 40.0f},
+    {"Дети",      &sim_params.sprout_cost,        4.00f, 4.00f, 240.f},
+    {"Семена",    &sim_params.seed_cost,          2.00f, 1.00f, 160.f},
+    {"Мутации",   &sim_params.mutation_scale,     0.25f, 0.00f, 20.0f},
+    {"Яды",       &sim_params.toxin_scale,        0.25f, 0.00f, 12.0f},
+};
+
+static const int SETTINGS_N = sizeof(SETTINGS) / sizeof(SETTINGS[0]);
+
+static void reset_sim_settings(){
+    sim_params = SimParams{0.18f,1.00f,1.00f,1.00f,1.00f,1.00f,1.00f,6.00f,48.0f,20.0f,1.00f,1.00f};
+    apply_sim_settings();
+}
+
 static void render_panel(uint64_t tick, int mx, int my){
     // фон
     frect(VIEW_W,0,PANEL_W,VIEW_H,{16,16,22,255});
@@ -145,6 +195,36 @@ static void render_panel(uint64_t tick, int mx, int my){
         draw_btn(b,false,SDL_PointInRect(&p,&b.r));
     }
     cy+=30;
+
+    Btn settings{{PX,cy,PANEL_W-16,24},"⚙ Настройки"};
+    {
+        SDL_Point p{mx,my};
+        draw_btn(settings,show_settings,SDL_PointInRect(&p,&settings.r));
+    }
+    cy+=30;
+
+    if(show_settings){
+        Btn reset_all{{PX,cy,PANEL_W-16,22},"Сбросить баланс"};
+        {
+            SDL_Point p{mx,my};
+            draw_btn(reset_all,false,SDL_PointInRect(&p,&reset_all.r));
+        }
+        cy+=26;
+
+        for(int i=0;i<SETTINGS_N;i++){
+            SettingDef& s = SETTINGS[i];
+            txt(cx,cy+3,s.label,{150,150,170,255});
+            Btn minus{{PX+92,cy,24,21},"-"};
+            Btn plus {{PX+206,cy,24,21},"+"};
+            SDL_Point p{mx,my};
+            draw_btn(minus,false,SDL_PointInRect(&p,&minus.r));
+            snprintf(buf,sizeof(buf),"%5.2f",*s.value);
+            txt(PX+124,cy+3,buf,{210,210,225,255});
+            draw_btn(plus,false,SDL_PointInRect(&p,&plus.r));
+            cy+=22;
+        }
+        cy+=4;
+    }
 
     snprintf(buf,sizeof(buf),"delay:%dмс  %dт/кадр  zoom:%.2f",tick_delay,ticks_per_frame,zoom);
     txt(cx,cy,buf,{130,130,150,255}); cy+=16;
@@ -237,11 +317,35 @@ static void handle_panel_click(int mx,int my){
     // рестарт
     if(btn_hit(mx,my,PX,cy,136,24)){
         sim_init((unsigned long long)time(nullptr));
+        apply_sim_settings();
         memset(&max_stats,0,sizeof(max_stats));
     }
     // камера
     if(btn_hit(mx,my,PX+144,cy,136,24)) reset_camera();
-    cy+=30; cy+=16;
+    cy+=30;
+    // настройки
+    if(btn_hit(mx,my,PX,cy,PANEL_W-16,24)) show_settings=!show_settings;
+    cy+=30;
+    if(show_settings){
+        if(btn_hit(mx,my,PX,cy,PANEL_W-16,22)) reset_sim_settings();
+        cy+=26;
+        for(int i=0;i<SETTINGS_N;i++){
+            SettingDef& s = SETTINGS[i];
+            bool changed = false;
+            if(btn_hit(mx,my,PX+92,cy,24,21)){
+                *s.value=std::max(s.minv,*s.value-s.step);
+                changed = true;
+            }
+            if(btn_hit(mx,my,PX+206,cy,24,21)){
+                *s.value=std::min(s.maxv,*s.value+s.step);
+                changed = true;
+            }
+            if(changed) apply_sim_settings();
+            cy+=22;
+        }
+        cy+=4;
+    }
+    cy+=16;
     // виды
     for(int i=0;i<6;i++){
         if(btn_hit(mx,my,PX,cy,PANEL_W-16,20)) rmode=i;
@@ -271,6 +375,7 @@ int main(){
 
     // инициализируем симуляцию
     sim_init((unsigned long long)time(nullptr));
+    apply_sim_settings();
 
     bool running=true;
     SDL_Event ev;
@@ -313,6 +418,7 @@ int main(){
                 case SDLK_SPACE:  paused=!paused; break;
                 case SDLK_r:
                     sim_init((unsigned long long)time(nullptr));
+                    apply_sim_settings();
                     memset(&max_stats,0,sizeof(max_stats));
                     break;
                 case SDLK_1: rmode=0; break; case SDLK_2: rmode=1; break;

@@ -8,11 +8,13 @@
 // ─── GPU буферы ────────────────────────────────────────────────
 __device__ Cell    d_grid[H][W];
 __device__ Soil    d_soil[H][W];
-__device__ Genome  d_gpool[1 << 17];  // 128k геномов
+__device__ Genome  d_gpool[GPOOL_MAX];
 __device__ int     d_gpool_size;
 __device__ uint8_t d_sig[H][W];
 __device__ Stats   d_stats;
+__device__ Stats   d_count_stats;
 __device__ uint64_t d_tick;
+__device__ SimParams d_params;
 
 // RNG на каждый поток
 __device__ curandState d_rng[H][W];
@@ -20,6 +22,95 @@ __device__ curandState d_rng[H][W];
 // ─── wrap координат ────────────────────────────────────────────
 __device__ inline int wx(int x){ return ((x % W) + W) % W; }
 __device__ inline int wy(int y){ return ((y % H) + H) % H; }
+
+__device__ inline bool valid_genome_idx(int gi){
+    return gi >= 0 && gi < GPOOL_MAX && gi < d_gpool_size;
+}
+
+__device__ int occupied_neighbors8(int x, int y){
+    int n = 0;
+    for(int dy=-1; dy<=1; dy++){
+        for(int dx=-1; dx<=1; dx++){
+            if(dx == 0 && dy == 0) continue;
+            if(d_grid[wy(y+dy)][wx(x+dx)].type != CT_EMPTY) n++;
+        }
+    }
+    return n;
+}
+
+__device__ float light_for_y(int y, float phase){
+    float depth = (float)y / (float)(H - 1);
+    float exposure = 0.06f + 0.94f * expf(-4.0f * depth);
+    return phase * exposure * d_params.light_scale;
+}
+
+__device__ uint8_t random_action(curandState* rng){
+    int r = curand(rng) % 100;
+    if(r < 8)   return ACT_WAIT;
+    if(r < 12)  return ACT_SLEEP;
+    if(r < 36)  return (uint8_t)(ACT_GROW_LEAF_U + (curand(rng) % 4));
+    if(r < 53)  return (uint8_t)(ACT_GROW_ROOT_D + (curand(rng) % 3));
+    if(r < 63)  return (uint8_t)(ACT_GROW_ANT_U + (curand(rng) % 3));
+    if(r < 70)  return (uint8_t)(ACT_GROW_DETOX_D + (curand(rng) % 3));
+    if(r < 82)  return (uint8_t)(ACT_SPROUT_U + (curand(rng) % 4));
+    if(r < 89)  return (uint8_t)(ACT_SHOOT_U + (curand(rng) % 4));
+    if(r < 93)  return (uint8_t)(ACT_EAT_U + (curand(rng) % 4));
+    if(r < 95)  return ACT_SKIP_LOW;
+    if(r < 96)  return ACT_SKIP_HIGH;
+    if(r < 97)  return ACT_SKIP_CROWD;
+    if(r < 98)  return ACT_SKIP_TOXIC;
+    if(r < 99)  return ACT_JUMP_B8;
+    return ACT_JUMP_F8;
+}
+
+__device__ void make_seed_genome(Genome& g, uint8_t clan, curandState* rng){
+    g.len = 24;
+    g.clan = clan;
+    for(int i=0; i<GENOME_MAX; i++) g.code[i] = ACT_WAIT;
+
+    const uint8_t base0[24] = {
+        ACT_GROW_LEAF_U, ACT_GROW_ROOT_D, ACT_GROW_LEAF_L, ACT_GROW_LEAF_R,
+        ACT_GROW_ANT_U, ACT_SKIP_LOW, ACT_SPROUT_R, ACT_SKIP_LOW,
+        ACT_SPROUT_L, ACT_GROW_DETOX_D, ACT_SKIP_CROWD, ACT_SHOOT_U,
+        ACT_WAIT, ACT_WAIT, ACT_WAIT, ACT_WAIT,
+        ACT_JUMP_B8, ACT_WAIT, ACT_WAIT, ACT_WAIT,
+        ACT_WAIT, ACT_WAIT, ACT_WAIT, ACT_WAIT
+    };
+    const uint8_t base1[24] = {
+        ACT_GROW_LEAF_U, ACT_GROW_LEAF_U, ACT_GROW_ROOT_D, ACT_GROW_ROOT_L,
+        ACT_GROW_ROOT_R, ACT_SKIP_LOW, ACT_SPROUT_U, ACT_SKIP_LOW,
+        ACT_SPROUT_D, ACT_GROW_DETOX_L, ACT_GROW_ANT_R, ACT_SHOOT_R,
+        ACT_WAIT, ACT_WAIT, ACT_WAIT, ACT_WAIT,
+        ACT_JUMP_B8, ACT_WAIT, ACT_WAIT, ACT_WAIT,
+        ACT_WAIT, ACT_WAIT, ACT_WAIT, ACT_WAIT
+    };
+    const uint8_t base2[24] = {
+        ACT_GROW_LEAF_U, ACT_GROW_ROOT_D, ACT_GROW_ANT_L, ACT_GROW_ANT_R,
+        ACT_SKIP_LOW, ACT_SPROUT_L, ACT_SKIP_TOXIC, ACT_GROW_DETOX_R,
+        ACT_SKIP_HIGH, ACT_EAT_R, ACT_SKIP_LOW, ACT_SHOOT_L,
+        ACT_WAIT, ACT_WAIT, ACT_WAIT, ACT_WAIT,
+        ACT_JUMP_B8, ACT_WAIT, ACT_WAIT, ACT_WAIT,
+        ACT_WAIT, ACT_WAIT, ACT_WAIT, ACT_WAIT
+    };
+    const uint8_t base3[24] = {
+        ACT_GROW_LEAF_L, ACT_GROW_LEAF_R, ACT_GROW_ROOT_D, ACT_GROW_DETOX_D,
+        ACT_GROW_ANT_U, ACT_SKIP_LOW, ACT_SPROUT_D, ACT_SKIP_LOW,
+        ACT_SPROUT_R, ACT_SKIP_CROWD, ACT_SHOOT_D, ACT_SLEEP,
+        ACT_WAIT, ACT_WAIT, ACT_WAIT, ACT_WAIT,
+        ACT_JUMP_B8, ACT_WAIT, ACT_WAIT, ACT_WAIT,
+        ACT_WAIT, ACT_WAIT, ACT_WAIT, ACT_WAIT
+    };
+
+    const uint8_t* src = base0;
+    if(clan == 1) src = base1;
+    else if(clan == 2) src = base2;
+    else if(clan == 3) src = base3;
+    for(int i=0; i<24; i++) g.code[i] = src[i];
+
+    for(int i=0; i<24; i++){
+        if(curand_uniform(rng) < 0.08f) g.code[i] = random_action(rng);
+    }
+}
 
 // ─── инициализация RNG ─────────────────────────────────────────
 __global__ void kernel_init_rng(unsigned long long seed){
@@ -31,28 +122,39 @@ __global__ void kernel_init_rng(unsigned long long seed){
 
 // ─── аллокация генома (атомарная) ─────────────────────────────
 __device__ int alloc_genome(){
-    return atomicAdd(&d_gpool_size, 1);
+    int old = d_gpool_size;
+    while(old < GPOOL_MAX){
+        int assumed = old;
+        old = atomicCAS(&d_gpool_size, assumed, assumed + 1);
+        if(old == assumed) return assumed;
+    }
+    return -1;
 }
 
 // ─── мутация генома ────────────────────────────────────────────
 __device__ Genome mutate(const Genome& g, curandState* rng){
     Genome ng = g;
     float r = curand_uniform(rng);
+    float ms = fminf(fmaxf(d_params.mutation_scale, 0.0f), 5.0f);
+    float add_t = 0.002f * ms;
+    float del_t = 0.004f * ms;
+    float swap_t = 0.04f * ms;
+    float edit_t = 0.25f * ms;
     int len = ng.len;
     if(len < 1) len = 1;
 
-    if(r < 0.002f && len < GENOME_MAX){
-        ng.code[len] = (uint8_t)(curand(rng) % ACT_COUNT);
+    if(r < add_t && len < GENOME_MAX){
+        ng.code[len] = random_action(rng);
         ng.len = len + 1;
-    } else if(r < 0.004f && len > 8){
+    } else if(r < del_t && len > 8){
         ng.len = len - 1;
-    } else if(r < 0.04f){
+    } else if(r < swap_t){
         int a = curand(rng) % len;
         int b = curand(rng) % len;
         uint8_t tmp = ng.code[a]; ng.code[a] = ng.code[b]; ng.code[b] = tmp;
-    } else if(r < 0.25f){
+    } else if(r < edit_t){
         int i = curand(rng) % len;
-        ng.code[i] = (uint8_t)(curand(rng) % ACT_COUNT);
+        ng.code[i] = random_action(rng);
     }
     return ng;
 }
@@ -67,38 +169,32 @@ __global__ void kernel_init_world(unsigned long long seed){
     curand_init(seed + 1, y*W+x, 0, &rng);
 
     // почва
-    d_soil[y][x].organic = curand_uniform(&rng) * 0.03f;
-    d_soil[y][x].charge  = 0.05f + curand_uniform(&rng) * 0.05f;
-    d_soil[y][x].toxin   = 0.0f;
-    d_soil[y][x].light   = (y < H/4) ? 2.0f : 0.0f;
+    d_soil[y][x].organic = 0.02f + curand_uniform(&rng) * 0.08f;
+    d_soil[y][x].charge  = 0.06f + curand_uniform(&rng) * 0.08f;
+    d_soil[y][x].toxin   = (curand_uniform(&rng) < 0.03f) ? curand_uniform(&rng) * 0.08f : 0.0f;
+    d_soil[y][x].light   = light_for_y(y, 4.0f);
 
     // пусто
     d_grid[y][x] = Cell{};
     d_sig[y][x]  = 0;
 
-    // посев — каждые 8 клеток
-    if(x%8==1 && y%8==1){
+    // Посев не полностью случайный: каждый клан стартует с жизнеспособной
+    // программы, а небольшая начальная вариативность дает материал отбору.
+    if(x%10==1 && y%10==1){
         int gi = alloc_genome();
-        if(gi < (1<<17)){
+        if(gi >= 0){
             Genome g;
-            g.len  = 64;
-            g.clan = (uint8_t)((x * NUM_CLANS) / W);
-            for(int i=0;i<64;i++) g.code[i] = (uint8_t)(curand(&rng) % ACT_COUNT);
+            uint8_t clan = (uint8_t)((x * NUM_CLANS) / W);
+            make_seed_genome(g, clan, &rng);
             d_gpool[gi] = g;
 
             Cell c{};
             c.type       = CT_SPROUT;
-            c.energy     = 80.f;
-            c.genome_idx = (int16_t)gi;
-            c.age_limit  = 200;
+            c.energy     = 55.f + curand_uniform(&rng) * 35.f;
+            c.genome_idx = gi;
+            c.age_limit  = 900 + (int)(curand_uniform(&rng) * 700);
             d_grid[y][x] = c;
         }
-    }
-
-    if(x==0 && y==0){
-        d_gpool_size = 0;
-        d_tick = 0;
-        memset(&d_stats, 0, sizeof(d_stats));
     }
 }
 
@@ -110,7 +206,7 @@ __global__ void kernel_update_light(uint64_t tick){
 
     static const float PHASES[] = {4.0f, 2.0f, 3.0f, 2.0f, 3.0f, 2.0f};
     float tf = PHASES[(tick / 300) % 6];
-    d_soil[y][x].light = (y < H/4) ? tf : 0.0f;
+    d_soil[y][x].light = light_for_y(y, tf);
 }
 
 // ─── передача энергии ──────────────────────────────────────────
@@ -146,6 +242,7 @@ __global__ void kernel_passive(uint64_t tick){
         // смерть
         for(int dy2=-1;dy2<=1;dy2++) for(int dx2=-1;dx2<=1;dx2++)
             atomicAdd(&d_soil[wy(y+dy2)][wx(x+dx2)].organic, c.energy*0.04f/9.f);
+        atomicAdd(&d_stats.deaths, 1);
         c = Cell{};
         return;
     }
@@ -157,46 +254,60 @@ __global__ void kernel_passive(uint64_t tick){
             const int dx[4]={0,0,-1,1}, dy[4]={-1,1,0,0};
             for(int d=0;d<4;d++)
                 if(d_grid[wy(y+dy[d])][wx(x+dx[d])].type==CT_LEAF){ nb_leaf=true; break; }
-            c.energy += open ? (nb_leaf ? 0.1f : s.light*2.0f) : s.light*0.2f;
+            c.energy += (open ? (nb_leaf ? s.light*0.35f : s.light*2.2f) : s.light*0.25f) * d_params.leaf_gain;
             push_energy(x,y,0.6f,12.f);
-            c.energy -= 0.4f;
+            c.energy -= 0.22f * d_params.passive_metabolism;
             break;
         }
         case CT_ROOT: {
-            float e = fminf(s.organic, 1.5f);
-            c.energy += e * 1.5f; s.organic -= e;
+            float e = fminf(s.organic, 1.0f);
+            c.energy += e * 1.9f * d_params.root_gain; s.organic -= e;
             push_energy(x,y,0.5f,6.f);
-            c.energy -= 0.3f;
+            c.energy -= 0.16f * d_params.passive_metabolism;
             break;
         }
         case CT_ANTENNA: {
-            float e = fminf(s.charge, 1.2f);
-            c.energy += e * 1.2f; s.charge -= e;
+            float e = fminf(s.charge, 0.9f);
+            c.energy += e * 1.4f * d_params.antenna_gain; s.charge -= e;
             push_energy(x,y,0.5f,4.f);
-            c.energy -= 0.3f;
+            c.energy -= 0.14f * d_params.passive_metabolism;
             break;
         }
         case CT_DETOX: {
             float e = fminf(s.toxin, 1.0f);
             c.energy += e * 2.f; s.toxin -= e;
             push_energy(x,y,0.4f,4.f);
-            c.energy -= 0.15f;
+            c.energy -= 0.10f * d_params.passive_metabolism;
             break;
         }
         case CT_WOOD:
-            c.energy -= 0.03f;
+            c.energy -= 0.02f * d_params.passive_metabolism;
             break;
         case CT_SEED:
-            c.energy -= 0.01f;
-            if(c.age > 50){ c.type=CT_SPROUT; c.age_steps=0; c.ip=0; }
+            c.energy -= 0.01f * d_params.passive_metabolism;
+            if(c.age > 35){
+                c.type=CT_SPROUT;
+                c.age_steps=0;
+                c.ip=0;
+                c.age=0;
+                if(c.age_limit < 500) c.age_limit = 900;
+            }
             break;
         default: break;
     }
 
+    c.energy = fminf(c.energy, 180.f);
+
+    int crowd = occupied_neighbors8(x, y) - 3;
+    if(crowd > 0){
+        float type_mul = (c.type == CT_WOOD) ? 0.35f : 1.0f;
+        c.energy -= d_params.crowd_penalty * crowd * type_mul;
+    }
+
     // яды
-    if(s.organic>0.7f && c.type!=CT_ROOT)    c.energy -= 1.0f;
-    if(s.charge >0.7f && c.type!=CT_ANTENNA) c.energy -= 1.0f;
-    if(s.toxin  >0.6f && c.type!=CT_DETOX)   c.energy -= 1.2f;
+    if(s.organic>0.7f && c.type!=CT_ROOT)    c.energy -= 1.0f * d_params.toxin_scale;
+    if(s.charge >0.7f && c.type!=CT_ANTENNA) c.energy -= 1.0f * d_params.toxin_scale;
+    if(s.toxin  >0.6f && c.type!=CT_DETOX)   c.energy -= 1.2f * d_params.toxin_scale;
 
     if(c.energy <= 0.f){
         atomicAdd(&d_soil[y][x].organic, 0.04f);
@@ -218,31 +329,37 @@ __global__ void kernel_sprout(uint64_t tick){
     curandState* rng = &d_rng[y][x];
     Soil& s = d_soil[y][x];
 
-    if(c.genome_idx < 0 || c.genome_idx >= d_gpool_size){ c=Cell{}; return; }
+    if(!valid_genome_idx(c.genome_idx)){ c=Cell{}; return; }
     Genome& g = d_gpool[c.genome_idx];
     int glen = g.len > 0 ? g.len : 1;
+    if(glen > GENOME_MAX) glen = GENOME_MAX;
 
     // сон
     if(c.sleeping){
+        c.age++;
         c.sleep_ticks--;
-        c.energy -= 0.05f;
+        c.energy += s.light * 0.08f;
+        c.energy -= 0.03f * d_params.sprout_metabolism;
         if(c.sleep_ticks <= 0) c.sleeping = 0;
         if(c.energy <= 0.f){ s.organic += 0.05f; c=Cell{}; }
         return;
     }
 
     // фотосинтез отростка
-    c.energy += s.light * 0.3f;
+    c.energy += s.light * 0.16f;
 
     // старость
-    if(c.age_steps >= glen){
-        s.organic += c.energy * 0.2f;
-        s.toxin   += 0.05f;
+    c.age++;
+    if(c.age > c.age_limit){
+        s.organic += c.energy * 0.12f;
+        s.toxin   += 0.03f;
         atomicAdd(&d_stats.deaths, 1);
         c = Cell{}; return;
     }
 
-    c.energy -= 0.8f;
+    c.energy -= 0.24f * d_params.sprout_metabolism;
+    int crowd = occupied_neighbors8(x, y);
+    if(crowd > 2) c.energy -= d_params.crowd_penalty * (crowd - 2) * 1.35f;
     if(c.energy <= 0.f){
         s.organic += 0.03f;
         atomicAdd(&d_stats.deaths, 1);
@@ -259,11 +376,13 @@ __global__ void kernel_sprout(uint64_t tick){
     auto try_grow_passive = [&](int dx, int dy, CellType t) -> bool {
         int nx=wx(x+dx), ny=wy(y+dy);
         Cell& nb = d_grid[ny][nx];
-        if(nb.type!=CT_EMPTY || c.energy<8.f) return false;
-        c.energy -= 8.f;
+        float cost = d_params.growth_cost;
+        if(nb.type!=CT_EMPTY || c.energy<cost + 1.f) return false;
+        c.energy -= cost;
         Cell nc{};
         nc.type      = t;
-        nc.energy    = 6.f;
+        nc.energy    = 4.5f;
+        nc.genome_idx = c.genome_idx;
         nc.age_limit = 250 + (int)(curand_uniform(rng)*200);
         nb = nc;
         return true;
@@ -272,16 +391,19 @@ __global__ void kernel_sprout(uint64_t tick){
     auto try_sprout = [&](int dx, int dy) -> bool {
         int nx=wx(x+dx), ny=wy(y+dy);
         Cell& nb = d_grid[ny][nx];
-        if(nb.type!=CT_EMPTY || c.energy<60.f) return false;
+        float cost = d_params.sprout_cost;
+        if(nb.type!=CT_EMPTY || c.energy<cost + 4.f) return false;
+        int target_crowd = occupied_neighbors8(nx, ny);
+        if(target_crowd > 5 && c.energy < 95.f) return false;
         int gi = alloc_genome();
-        if(gi >= (1<<17)) return false;
-        d_gpool[gi] = mutate(g, rng);
-        c.energy -= 60.f;
+        if(gi >= 0) d_gpool[gi] = mutate(g, rng);
+        else gi = c.genome_idx;
+        c.energy -= cost + d_params.crowd_penalty * fmaxf(0, target_crowd - 2) * 5.f;
         Cell nc{};
         nc.type       = CT_SPROUT;
-        nc.energy     = 15.f;
-        nc.genome_idx = (int16_t)gi;
-        nc.age_limit  = 200;
+        nc.energy     = 24.f;
+        nc.genome_idx = gi;
+        nc.age_limit  = 800 + (int)(curand_uniform(rng)*800);
         nb = nc;
         atomicAdd(&d_stats.births, 1);
         return true;
@@ -313,15 +435,20 @@ __global__ void kernel_sprout(uint64_t tick){
         case ACT_SHOOT_U: case ACT_SHOOT_D: case ACT_SHOOT_L: case ACT_SHOOT_R: {
             int di = act - ACT_SHOOT_U;
             int nx=wx(x+DX[di]), ny=wy(y+DY[di]);
-            if(d_grid[ny][nx].type==CT_EMPTY && c.energy>=20.f){
+            float cost = d_params.seed_cost;
+            if(d_grid[ny][nx].type==CT_EMPTY && c.energy>=cost + 4.f){
+                int target_crowd = occupied_neighbors8(nx, ny);
+                if(target_crowd > 6 && c.energy < 80.f) break;
                 int gi=alloc_genome();
-                if(gi<(1<<17)){
-                    d_gpool[gi]=mutate(g,rng);
-                    c.energy-=18.f;
+                if(gi >= 0) d_gpool[gi]=mutate(g,rng);
+                else gi = c.genome_idx;
+                if(valid_genome_idx(gi)){
+                    c.energy-=cost + d_params.crowd_penalty * fmaxf(0, target_crowd - 2) * 3.f;
                     Cell seed{};
-                    seed.type=CT_SEED; seed.energy=10.f;
-                    seed.genome_idx=(int16_t)gi; seed.age_limit=200;
+                    seed.type=CT_SEED; seed.energy=16.f;
+                    seed.genome_idx=gi; seed.age_limit=900;
                     d_grid[ny][nx]=seed;
+                    atomicAdd(&d_stats.births, 1);
                 }
             }
             break;
@@ -365,9 +492,10 @@ __global__ void kernel_sprout(uint64_t tick){
     if(!was_wait) c.age_steps++;
     c.ip = (c.ip+1) % glen;
 
-    if(s.organic>0.7f) c.energy -= 0.7f;
-    if(s.charge >0.7f) c.energy -= 0.7f;
-    if(s.toxin  >0.6f) c.energy -= 1.0f;
+    if(s.organic>0.7f) c.energy -= 0.7f * d_params.toxin_scale;
+    if(s.charge >0.7f) c.energy -= 0.7f * d_params.toxin_scale;
+    if(s.toxin  >0.6f) c.energy -= 1.0f * d_params.toxin_scale;
+    c.energy = fminf(c.energy, 220.f);
 
     if(c.energy<=0.f){
         s.organic+=0.08f; s.toxin+=0.03f;
@@ -394,11 +522,45 @@ __global__ void kernel_stats(){
     if(x>=W||y>=H) return;
     Cell& c = d_grid[y][x];
     if(c.type==CT_EMPTY) return;
-    atomicAdd(&d_stats.cells,1);
-    if(c.type==CT_SPROUT) atomicAdd(&d_stats.sprouts,1);
-    if(c.type==CT_LEAF)   atomicAdd(&d_stats.leaves,1);
-    if(c.genome_idx>=0&&c.genome_idx<d_gpool_size)
-        atomicAdd(&d_stats.clan_count[d_gpool[c.genome_idx].clan%NUM_CLANS],1);
+    atomicAdd(&d_count_stats.cells,1);
+    if(c.type==CT_SPROUT) atomicAdd(&d_count_stats.sprouts,1);
+    if(c.type==CT_LEAF)   atomicAdd(&d_count_stats.leaves,1);
+    if(valid_genome_idx(c.genome_idx))
+        atomicAdd(&d_count_stats.clan_count[d_gpool[c.genome_idx].clan%NUM_CLANS],1);
+}
+
+__device__ inline uint32_t rgb(int r, int g, int b){
+    r = max(0, min(255, r));
+    g = max(0, min(255, g));
+    b = max(0, min(255, b));
+    return 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+__device__ inline uint32_t shade(uint32_t col, float mul, int add=0){
+    int r = (int)(((col >> 16) & 0xFF) * mul) + add;
+    int g = (int)(((col >> 8) & 0xFF) * mul) + add;
+    int b = (int)((col & 0xFF) * mul) + add;
+    return rgb(r,g,b);
+}
+
+__device__ inline uint32_t mix_rgb(uint32_t a, uint32_t b, float t){
+    t = fminf(1.0f, fmaxf(0.0f, t));
+    int ar=(a>>16)&0xFF, ag=(a>>8)&0xFF, ab=a&0xFF;
+    int br=(b>>16)&0xFF, bg=(b>>8)&0xFF, bb=b&0xFF;
+    return rgb((int)(ar + (br-ar)*t), (int)(ag + (bg-ag)*t), (int)(ab + (bb-ab)*t));
+}
+
+__device__ inline float cell_noise(int x, int y){
+    uint32_t n = (uint32_t)(x * 374761393u + y * 668265263u);
+    n = (n ^ (n >> 13u)) * 1274126177u;
+    n ^= n >> 16u;
+    return (float)(n & 255u) / 255.0f;
+}
+
+__device__ uint32_t clan_color(int clan){
+    const uint32_t CC[8]={0xFFFF5050,0xFF50D250,0xFF5082FF,0xFFFFC828,
+                          0xFFFF70C8,0xFF28E1C8,0xFFDC8C28,0xFFAA50FF};
+    return CC[clan & 7];
 }
 
 // ─── рендер в пиксельный буфер ─────────────────────────────────
@@ -423,32 +585,68 @@ __global__ void kernel_render(uint32_t* pixels, int pw, int ph,
     const Cell& c = d_grid[gy][gx];
     const Soil& s = d_soil[gy][gx];
 
-    uint32_t col = 0xFF0C0C12; // фон мира
+    float n = cell_noise(gx,gy);
+    uint32_t col = rgb(10 + (int)(s.organic*35.f) + (int)(n*5.f),
+                       10 + (int)(s.light*6.f) + (int)(s.organic*20.f),
+                       16 + (int)(s.charge*32.f) + (int)(s.toxin*40.f));
 
     if(rmode == 0){ // клетки
-        switch(c.type){
-            case CT_SPROUT: {
-                const uint32_t CC[8]={0xFFFF5050,0xFF50D250,0xFF5082FF,0xFFFFC828,
-                                      0xFFFF70C8,0xFF28E1C8,0xFFDC8C28,0xFFAA50FF};
-                int clan = (c.genome_idx>=0&&c.genome_idx<d_gpool_size) ?
-                           d_gpool[c.genome_idx].clan%NUM_CLANS : 0;
-                col = CC[clan]; break;
+        if(c.type != CT_EMPTY){
+            float energy = fminf(2.2f, fmaxf(0.35f, c.energy / 70.0f));
+            float age = fminf(1.0f, fmaxf(0.0f, (float)c.age / fmaxf(1.0f, (float)c.age_limit)));
+            float vigor = 0.72f + energy * 0.22f - age * 0.18f;
+            bool edge = false;
+            const int dx4[4]={0,0,-1,1}, dy4[4]={-1,1,0,0};
+            for(int d=0; d<4; d++){
+                CellType nt = d_grid[wy(gy+dy4[d])][wx(gx+dx4[d])].type;
+                if(nt == CT_EMPTY || nt != c.type){ edge = true; break; }
             }
-            case CT_LEAF:    col=0xFF28A028; break;
-            case CT_ROOT:    col=0xFFA06428; break;
-            case CT_ANTENNA: col=0xFF3C78C8; break;
-            case CT_DETOX:   col=0xFFB43CC8; break;
-            case CT_WOOD:    col=0xFF5A3719; break;
-            case CT_SEED:    col=0xFFE6D250; break;
-            default: break;
+            float u = fx - floorf(fx);
+            float v = fy - floorf(fy);
+            bool rim = zoom >= 3.0f && (u < 0.10f || v < 0.10f || u > 0.90f || v > 0.90f);
+
+            switch(c.type){
+                case CT_SPROUT: {
+                    int clan = valid_genome_idx(c.genome_idx) ? d_gpool[c.genome_idx].clan%NUM_CLANS : 0;
+                    col = mix_rgb(clan_color(clan), 0xFFFFFFFF, 0.10f + fminf(0.35f, energy*0.08f));
+                    break;
+                }
+                case CT_LEAF:
+                    col = rgb(24 + (int)(s.light*10.f), 115 + (int)(energy*38.f), 34 + (int)(n*26.f));
+                    break;
+                case CT_ROOT:
+                    col = rgb(118 + (int)(energy*22.f), 70 + (int)(s.organic*45.f), 30 + (int)(n*24.f));
+                    break;
+                case CT_ANTENNA:
+                    col = rgb(50 + (int)(s.charge*80.f), 110 + (int)(energy*18.f), 190 + (int)(energy*32.f));
+                    break;
+                case CT_DETOX:
+                    col = rgb(150 + (int)(energy*28.f), 55 + (int)(n*30.f), 185 + (int)(s.toxin*75.f));
+                    break;
+                case CT_WOOD:
+                    col = rgb(76 + (int)(n*22.f), 45 + (int)(energy*10.f), 22 + (int)(n*14.f));
+                    if(zoom >= 5.0f && ((int)(u*6.0f) % 2 == 0)) col = shade(col,0.78f);
+                    break;
+                case CT_SEED:
+                    col = rgb(215 + (int)(energy*12.f), 190 + (int)(n*35.f), 70);
+                    if(zoom >= 4.0f){
+                        float du = u - 0.5f, dv = v - 0.5f;
+                        if(du*du + dv*dv > 0.20f) col = shade(col,0.55f);
+                    }
+                    break;
+                default: break;
+            }
+            col = shade(col, vigor);
+            if(edge) col = mix_rgb(col, 0xFF050508, 0.28f);
+            if(rim) col = shade(col, 0.55f);
+            if(c.signal & 1) col = mix_rgb(col, 0xFFFF6060, 0.18f);
+            if(c.signal & 2) col = mix_rgb(col, 0xFF60A0FF, 0.18f);
         }
     } else if(rmode==5){ // кланы
         if(c.type!=CT_EMPTY){
-            const uint32_t CC[8]={0xFFFF5050,0xFF50D250,0xFF5082FF,0xFFFFC828,
-                                  0xFFFF70C8,0xFF28E1C8,0xFFDC8C28,0xFFAA50FF};
-            int clan = (c.genome_idx>=0&&c.genome_idx<d_gpool_size) ?
+            int clan = valid_genome_idx(c.genome_idx) ?
                        d_gpool[c.genome_idx].clan%NUM_CLANS : 0;
-            col = CC[clan];
+            col = clan_color(clan);
         }
     } else {
         float v=0.f;
@@ -493,6 +691,23 @@ void sim_init(unsigned long long seed){
     cudaMemcpyToSymbol(d_gpool_size,&zero,sizeof(int));
     uint64_t tzero=0;
     cudaMemcpyToSymbol(d_tick,&tzero,sizeof(uint64_t));
+    Stats szero{};
+    cudaMemcpyToSymbol(d_stats,&szero,sizeof(Stats));
+    cudaMemcpyToSymbol(d_count_stats,&szero,sizeof(Stats));
+    SimParams defaults{};
+    defaults.crowd_penalty = 0.18f;
+    defaults.light_scale = 1.0f;
+    defaults.leaf_gain = 1.0f;
+    defaults.root_gain = 1.0f;
+    defaults.antenna_gain = 1.0f;
+    defaults.sprout_metabolism = 1.0f;
+    defaults.passive_metabolism = 1.0f;
+    defaults.growth_cost = 6.0f;
+    defaults.sprout_cost = 48.0f;
+    defaults.seed_cost = 20.0f;
+    defaults.mutation_scale = 1.0f;
+    defaults.toxin_scale = 1.0f;
+    cudaMemcpyToSymbol(d_params,&defaults,sizeof(SimParams));
     kernel_init_world<<<grid_dim,block>>>(seed);
     cudaError_t err = cudaDeviceSynchronize();
     if(err != cudaSuccess)
@@ -518,6 +733,23 @@ void sim_tick(){
     cudaMemcpyToSymbol(d_tick,&tick_val,sizeof(uint64_t));
 }
 
+void sim_set_params(const SimParams* params){
+    SimParams p = *params;
+    p.crowd_penalty = fminf(fmaxf(p.crowd_penalty, 0.0f), 3.0f);
+    p.light_scale = fminf(fmaxf(p.light_scale, 0.0f), 10.0f);
+    p.leaf_gain = fminf(fmaxf(p.leaf_gain, 0.0f), 8.0f);
+    p.root_gain = fminf(fmaxf(p.root_gain, 0.0f), 8.0f);
+    p.antenna_gain = fminf(fmaxf(p.antenna_gain, 0.0f), 8.0f);
+    p.sprout_metabolism = fminf(fmaxf(p.sprout_metabolism, 0.05f), 10.0f);
+    p.passive_metabolism = fminf(fmaxf(p.passive_metabolism, 0.05f), 10.0f);
+    p.growth_cost = fminf(fmaxf(p.growth_cost, 0.5f), 40.0f);
+    p.sprout_cost = fminf(fmaxf(p.sprout_cost, 4.0f), 240.0f);
+    p.seed_cost = fminf(fmaxf(p.seed_cost, 1.0f), 160.0f);
+    p.mutation_scale = fminf(fmaxf(p.mutation_scale, 0.0f), 20.0f);
+    p.toxin_scale = fminf(fmaxf(p.toxin_scale, 0.0f), 12.0f);
+    cudaMemcpyToSymbol(d_params,&p,sizeof(SimParams));
+}
+
 void sim_render(uint32_t* d_pixels, int pw, int ph,
                 float cam_x, float cam_y, float zoom, int rmode){
     dim3 block(16,16);
@@ -527,12 +759,16 @@ void sim_render(uint32_t* d_pixels, int pw, int ph,
 
 void sim_get_stats(Stats* out){
     Stats zero{};
-    cudaMemcpyToSymbol(d_stats,&zero,sizeof(Stats));
+    cudaMemcpyToSymbol(d_count_stats,&zero,sizeof(Stats));
     dim3 block(16,16);
     dim3 grid_dim((W+15)/16,(H+15)/16);
     kernel_stats<<<grid_dim,block>>>();
     cudaDeviceSynchronize();
-    cudaMemcpyFromSymbol(out,d_stats,sizeof(Stats));
+    cudaMemcpyFromSymbol(out,d_count_stats,sizeof(Stats));
+    Stats life{};
+    cudaMemcpyFromSymbol(&life,d_stats,sizeof(Stats));
+    out->births = life.births;
+    out->deaths = life.deaths;
 }
 
 uint64_t sim_get_tick(){
